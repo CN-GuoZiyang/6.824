@@ -9,13 +9,27 @@ package mr
 import "os"
 import "strconv"
 
-// Add your RPC definitions here.
 type GetJobRequest struct {
 }
 
 type GetJobResponse struct {
-	success bool
-	task    Task
+	Success bool
+	Task    Task
+}
+
+type ImDoneRequest struct {
+	TaskType TaskType
+	TaskId   int
+}
+
+type ImDoneResponse struct {
+}
+
+type MapDoneRequest struct {
+}
+
+type MapDoneResponse struct {
+	Done bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name
