@@ -2,7 +2,6 @@ package mr
 
 import (
 	"log"
-	"sync"
 	"time"
 )
 import "net"
@@ -10,121 +9,78 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-type TaskType int64
-
-var (
-	TaskType_Map    TaskType = 0
-	TaskType_Reduce TaskType = 1
-)
+type ReduceTask struct {
+	nMap int
+}
 
 type MapTask struct {
-	File          string
-	ReduceTaskNum int
+	fileName string
+	nReduce  int
 }
 
-type ReduceTask struct {
-	MapTaskNum int
-}
+type TaskStatus int
+
+var (
+	TaskStatus_Idle     TaskStatus = 0
+	TaskStatus_Running  TaskStatus = 1
+	TaskStatus_Finished TaskStatus = 2
+)
 
 type Task struct {
-	TaskId   int
-	TaskType TaskType
-
-	MapTask    *MapTask
-	ReduceTask *ReduceTask
+	TaskId     int
+	MapTask    MapTask
+	ReduceTask ReduceTask
+	TaskStatus TaskStatus
 }
 
-type TaskPool struct {
-	mapTask    map[int]*Task
-	reduceTask map[int]*Task
-}
+type TaskPhase int
+
+var (
+	TaskPhase_Map    TaskPhase = 0
+	TaskPhase_Reduce TaskPhase = 1
+)
 
 type Coordinator struct {
-	idleTask     TaskPool
-	workingTask  TaskPool
-	finishedTask []*Task
-	lock         sync.RWMutex
-	taskStartMap map[*Task]time.Time
+	nMap    int
+	nReduce int
+	phase   TaskPhase
+
+	taskTimeOut map[DoneTaskReq]time.Time
+	tasks       []*Task
+
+	getTaskChan   chan GetTaskMsg
+	doneTaskChan  chan DoneTaskMsg
+	heartBeatChan chan HeartBeatMsg
+	doneCheckChan chan DoneCheckMsg
+	timeoutChan   chan TimeoutMsg
 }
 
-// GetJob get a task for a worker and record the worker state
-func (c *Coordinator) GetJob(req *GetJobRequest, resp *GetJobResponse) error {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if len(c.idleTask.mapTask) == 0 && len(c.idleTask.reduceTask) == 0 {
-		resp.Success = false
-		return nil
-	}
-	// pick the first task
-	var task *Task
-	for taskId, t := range c.idleTask.mapTask {
-		task = t
-		delete(c.idleTask.mapTask, taskId)
-		break
-	}
-	if task == nil {
-		// get reduce task
-		for taskId, t := range c.idleTask.reduceTask {
-			task = t
-			delete(c.idleTask.reduceTask, taskId)
-			break
-		}
-	}
-	if task == nil {
-		// something wrong! return
-		resp.Success = false
-		return nil
-	}
-	resp.Success = true
-	resp.Task = *task
-
-	// add task to working task
-	if task.TaskType == TaskType_Map {
-		c.workingTask.mapTask[task.TaskId] = task
-	} else {
-		c.workingTask.reduceTask[task.TaskId] = task
-	}
-	c.taskStartMap[task] = time.Now()
-
-	return nil
+type GetTaskMsg struct {
+	resp *GetTaskResp
+	ok   chan struct{}
 }
 
-// DoneWork someone has finished his job!
-func (c *Coordinator) DoneWork(req *ImDoneRequest, resp *ImDoneResponse) error {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if req.TaskType == TaskType_Map {
-		if _, ok := c.workingTask.mapTask[req.TaskId]; !ok {
-			// repeated submit
-			return nil
-		}
-		task := c.workingTask.mapTask[req.TaskId]
-		delete(c.workingTask.mapTask, req.TaskId)
-		delete(c.taskStartMap, task)
-		c.finishedTask = append(c.finishedTask, task)
-	} else {
-		if _, ok := c.workingTask.reduceTask[req.TaskId]; !ok {
-			// repeated submit
-			return nil
-		}
-		task := c.workingTask.reduceTask[req.TaskId]
-		delete(c.workingTask.reduceTask, req.TaskId)
-		delete(c.taskStartMap, task)
-		c.finishedTask = append(c.finishedTask, task)
-	}
-	return nil
+type DoneTaskMsg struct {
+	req *DoneTaskReq
+	ok  chan struct{}
 }
 
-// MapDone find out if all map work have done
-func (c *Coordinator) MapDone(req *MapDoneRequest, resp *MapDoneResponse) error {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	resp.Done = false
-	if len(c.idleTask.mapTask) == 0 && len(c.workingTask.mapTask) == 0 {
-		resp.Done = true
-	}
-	return nil
+type HeartBeatMsg struct {
+	req *HeartBeatReq
+	ok  chan struct{}
 }
+
+type DoneCheckMsg struct {
+	res *bool
+	ok  chan struct{}
+}
+
+type TimeoutMsg struct {
+	task *DoneTaskReq
+	ok   chan struct{}
+}
+
+// Your code here -- RPC handlers for the worker to call.
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -142,74 +98,163 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// Done
+//
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	if len(c.idleTask.mapTask) == 0 && len(c.idleTask.reduceTask) == 0 &&
-		len(c.workingTask.mapTask) == 0 && len(c.workingTask.reduceTask) == 0 {
-		// all clear
-		return true
+	ret := false
+	msg := DoneCheckMsg{
+		res: &ret,
+		ok:  make(chan struct{}),
 	}
-	return false
+	c.doneCheckChan <- msg
+	<-msg.ok
+	return ret
 }
 
-// MakeCoordinator
+func (c *Coordinator) getTaskHandler(msg GetTaskMsg) {
+	resp := msg.resp
+	allDone := true
+	for _, task := range c.tasks {
+		if task.TaskStatus == TaskStatus_Idle {
+			// 发现空闲任务
+			resp.TaskType = TaskType_Map
+			if c.phase == TaskPhase_Reduce {
+				resp.TaskType = TaskType_Reduce
+			}
+			resp.Task = *task
+			task.TaskStatus = TaskStatus_Running
+			c.taskTimeOut[DoneTaskReq{
+				TaskType: resp.TaskType,
+				TaskId:   task.TaskId,
+			}] = time.Now()
+			msg.ok <- struct{}{}
+			return
+		}
+		if task.TaskStatus != TaskStatus_Finished {
+			allDone = false
+		}
+	}
+	// 没有空闲任务
+	if c.phase == TaskPhase_Map {
+		// 仍位于 map 阶段
+		resp.TaskType = TaskType_Wait
+		msg.ok <- struct{}{}
+		return
+	} else {
+		// 位于 reduce 阶段
+		if !allDone {
+			// 没有全部结束
+
+		} else {
+
+		}
+	}
+}
+
+func (c *Coordinator) doneTaskHandler(msg DoneTaskMsg) {
+
+}
+
+func (c *Coordinator) heartBeatHandler(msg HeartBeatMsg) {
+
+}
+
+func (c *Coordinator) timeoutHandler(msg TimeoutMsg) {
+
+}
+
+func (c *Coordinator) doneCheckHandler(msg DoneCheckMsg) {
+
+}
+
+// 只在这个 goroutine 中操作结构
+func (c *Coordinator) schedule() {
+	for {
+		select {
+		case msg := <-c.getTaskChan:
+			c.getTaskHandler(msg)
+		case msg := <-c.doneTaskChan:
+			c.doneTaskHandler(msg)
+		case msg := <-c.heartBeatChan:
+			c.heartBeatHandler(msg)
+		case msg := <-c.timeoutChan:
+			c.timeoutHandler(msg)
+		case msg := <-c.doneCheckChan:
+			c.doneCheckHandler(msg)
+		}
+	}
+}
+
+func (c *Coordinator) GetTask(_ *GetTaskReq, resp *GetTaskResp) error {
+	msg := GetTaskMsg{
+		resp: resp,
+		ok:   make(chan struct{}),
+	}
+	c.getTaskChan <- msg
+	<-msg.ok
+	return nil
+}
+
+func (c *Coordinator) DoneTask(req *DoneTaskReq, _ *DoneTaskResp) error {
+	msg := DoneTaskMsg{
+		req: req,
+		ok:  make(chan struct{}),
+	}
+	c.doneTaskChan <- msg
+	<-msg.ok
+	return nil
+}
+
+func (c *Coordinator) HeartBeat(req *HeartBeatReq, _ *HeartBeatResp) error {
+	msg := HeartBeatMsg{
+		req: req,
+		ok:  make(chan struct{}),
+	}
+	c.heartBeatChan <- msg
+	<-msg.ok
+	return nil
+}
+
+// 初始化 map 任务阶段
+func (c *Coordinator) initPhase(fileNames []string) {
+	c.phase = TaskPhase_Map
+	for i, fileName := range fileNames {
+		c.tasks = append(c.tasks, &Task{
+			TaskId: i,
+			MapTask: MapTask{
+				fileName: fileName,
+				nReduce:  c.nReduce,
+			},
+			TaskStatus: TaskStatus_Idle,
+		})
+	}
+}
+
+func (c *Coordinator) timeoutCheck() {
+
+}
+
+//
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-	c.idleTask.mapTask = map[int]*Task{}
-	c.idleTask.reduceTask = map[int]*Task{}
-	c.workingTask.mapTask = map[int]*Task{}
-	c.workingTask.reduceTask = map[int]*Task{}
-	c.taskStartMap = map[*Task]time.Time{}
-	// prepare for tasks
-	for index, file := range files {
-		c.idleTask.mapTask[index] = &Task{
-			TaskId:   index,
-			TaskType: TaskType_Map,
-			MapTask: &MapTask{
-				File:          file,
-				ReduceTaskNum: nReduce,
-			},
-		}
+	c := Coordinator{
+		nMap:          len(files),
+		nReduce:       nReduce,
+		taskTimeOut:   map[DoneTaskReq]time.Time{},
+		getTaskChan:   make(chan GetTaskMsg),
+		doneTaskChan:  make(chan DoneTaskMsg),
+		heartBeatChan: make(chan HeartBeatMsg),
+		doneCheckChan: make(chan DoneCheckMsg),
+		timeoutChan:   make(chan TimeoutMsg),
 	}
-	for i := 0; i < nReduce; i++ {
-		c.idleTask.reduceTask[i] = &Task{
-			TaskId:   i,
-			TaskType: TaskType_Reduce,
-			ReduceTask: &ReduceTask{
-				MapTaskNum: len(files),
-			},
-		}
-	}
-	go func() {
-		for {
-			time.Sleep(time.Second)
-			now := time.Now()
-			c.lock.Lock()
-			for task, startTime := range c.taskStartMap {
-				if now.Sub(startTime).Seconds() > 10 {
-					// timeout!
-					if task.TaskType == TaskType_Map {
-						delete(c.workingTask.mapTask, task.TaskId)
-						c.idleTask.mapTask[task.TaskId] = task
-					} else {
-						delete(c.workingTask.reduceTask, task.TaskId)
-						c.idleTask.reduceTask[task.TaskId] = task
-					}
-					delete(c.taskStartMap, task)
-				}
-			}
-			c.lock.Unlock()
-		}
-	}()
+	c.initPhase(files)
+	go c.schedule()
+	go c.timeoutCheck()
 	c.server()
 	return &c
 }

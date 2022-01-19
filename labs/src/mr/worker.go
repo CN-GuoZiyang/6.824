@@ -1,11 +1,7 @@
 package mr
 
 import (
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"os"
-	"sort"
 	"time"
 )
 import "log"
@@ -30,148 +26,39 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+//
+// main/mrworker.go calls this function.
+//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	for {
-		resp := GetJob()
-		if !resp.Success {
-			break
+		resp := callGetTask()
+		switch resp.TaskType {
+		case TaskType_Map:
+			handleMapTask(resp.Task)
+		case TaskType_Reduce:
+			handleReduceTask(resp.Task)
+		case TaskType_Wait:
+			time.Sleep(time.Second)
+		case TaskType_Exit:
+			return
 		}
-		task := resp.Task
-		// just do it!
-		var err error
-		if task.TaskType == TaskType_Map {
-			err = mapWork(task, mapf)
-		} else {
-			err = reduceWork(task, reducef)
-		}
-		if err != nil {
-			break
-		}
-		// tell master I'm done
-		ImDone(&task)
 	}
 }
 
-func mapWork(task Task, mapf func(string, string) []KeyValue) error {
-	fileName := task.MapTask.File
-	file, err := os.Open(fileName)
-	if err != nil {
-		log.Fatalf("cannot open %v", fileName)
-		return err
-	}
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Fatalf("cannot read %v", fileName)
-	}
-	file.Close()
-	kva := mapf(fileName, string(content))
-	buffer := map[int][]KeyValue{}
-	for _, keyValue := range kva {
-		reduceTaskId := ihash(keyValue.Key) % task.MapTask.ReduceTaskNum
-		buffer[reduceTaskId] = append(buffer[reduceTaskId], keyValue)
-	}
-	for hash, kvs := range buffer {
-		fileFmt := "mr-%d-%d"
-		outFileName := fmt.Sprintf(fileFmt, task.TaskId, hash)
-		tempFile, err := ioutil.TempFile("", "mr-map-*")
-		if err != nil {
-			log.Fatalf("cannot create %v", outFileName)
-			return err
-		}
-		encoder := json.NewEncoder(tempFile)
-		if err = encoder.Encode(kvs); err != nil {
-			log.Fatalf("cannot write %v", outFileName)
-		}
-		tempFile.Close()
-		os.Rename(tempFile.Name(), outFileName)
-	}
-	return nil
+func handleReduceTask(task Task) {
+
 }
 
-// for sorting by key.
-type ByKey []KeyValue
+func handleMapTask(task Task) {
 
-// for sorting by key.
-func (a ByKey) Len() int           { return len(a) }
-func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
-
-func reduceWork(task Task, reducef func(string, []string) string) error {
-	for {
-		if MapDone() {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	var intermediate []KeyValue
-	for i := 0; i < task.ReduceTask.MapTaskNum; i++ {
-		fileName := fmt.Sprintf("mr-%d-%d", i, task.TaskId)
-		file, err := os.Open(fileName)
-		if err != nil {
-			log.Fatalf("cannot open %v", fileName)
-			return err
-		}
-		decoder := json.NewDecoder(file)
-		var kvs []KeyValue
-		if err := decoder.Decode(&kvs); err != nil {
-			break
-		}
-		intermediate = append(intermediate, kvs...)
-	}
-	sort.Sort(ByKey(intermediate))
-	oname := fmt.Sprintf("mr-out-%d", task.TaskId)
-	tempFile, err := ioutil.TempFile("", "mr-reduce-*")
-	if err != nil {
-		log.Fatalf("cannot create %v", tempFile)
-	}
-	// from mrsequential.go
-	i := 0
-	for i < len(intermediate) {
-		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-			j++
-		}
-		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
-		}
-		output := reducef(intermediate[i].Key, values)
-		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
-		i = j
-	}
-	tempFile.Close()
-	os.Rename(tempFile.Name(), oname)
-	return nil
 }
 
-// GetJob Every one needs a job
-// Not to mention a worker!
-func GetJob() *GetJobResponse {
-	req := GetJobRequest{}
-	resp := GetJobResponse{}
-	call("Coordinator.GetJob", &req, &resp)
-	return &resp
-}
-
-// ImDone tell master I'm done
-// don't need a response!
-func ImDone(task *Task) {
-	req := ImDoneRequest{
-		TaskType: task.TaskType,
-		TaskId:   task.TaskId,
-	}
-	resp := ImDoneResponse{}
-	call("Coordinator.DoneWork", &req, &resp)
-}
-
-// MapDone ask if all map work have done
-func MapDone() bool {
-	req := MapDoneRequest{}
-	resp := MapDoneResponse{}
-	call("Coordinator.MapDone", &req, &resp)
-	return resp.Done
+func callGetTask() *GetTaskResp {
+	req := &GetTaskReq{}
+	resp := &GetTaskResp{}
+	call("coordinator.GetTask", req, resp)
+	return resp
 }
 
 //
