@@ -39,14 +39,6 @@ type DoneTaskReq struct {
 type DoneTaskResp struct {
 }
 
-type HeartBeatReq struct {
-	TaskType TaskType
-	TaskId   int
-}
-
-type HeartBeatResp struct {
-}
-
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since

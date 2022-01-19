@@ -10,12 +10,12 @@ import "net/rpc"
 import "net/http"
 
 type ReduceTask struct {
-	nMap int
+	NMap int
 }
 
 type MapTask struct {
-	fileName string
-	nReduce  int
+	FileName string
+	NReduce  int
 }
 
 type TaskStatus int
@@ -44,13 +44,13 @@ type Coordinator struct {
 	nMap    int
 	nReduce int
 	phase   TaskPhase
+	allDone bool
 
-	taskTimeOut map[DoneTaskReq]time.Time
+	taskTimeOut map[int]time.Time
 	tasks       []*Task
 
 	getTaskChan   chan GetTaskMsg
 	doneTaskChan  chan DoneTaskMsg
-	heartBeatChan chan HeartBeatMsg
 	doneCheckChan chan DoneCheckMsg
 	timeoutChan   chan TimeoutMsg
 }
@@ -65,19 +65,13 @@ type DoneTaskMsg struct {
 	ok  chan struct{}
 }
 
-type HeartBeatMsg struct {
-	req *HeartBeatReq
-	ok  chan struct{}
-}
-
 type DoneCheckMsg struct {
 	res *bool
 	ok  chan struct{}
 }
 
 type TimeoutMsg struct {
-	task *DoneTaskReq
-	ok   chan struct{}
+	ok chan struct{}
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -125,10 +119,7 @@ func (c *Coordinator) getTaskHandler(msg GetTaskMsg) {
 			}
 			resp.Task = *task
 			task.TaskStatus = TaskStatus_Running
-			c.taskTimeOut[DoneTaskReq{
-				TaskType: resp.TaskType,
-				TaskId:   task.TaskId,
-			}] = time.Now()
+			c.taskTimeOut[task.TaskId] = time.Now()
 			msg.ok <- struct{}{}
 			return
 		}
@@ -145,28 +136,73 @@ func (c *Coordinator) getTaskHandler(msg GetTaskMsg) {
 	} else {
 		// 位于 reduce 阶段
 		if !allDone {
-			// 没有全部结束
-
+			// 没有全部结束，等待
+			resp.TaskType = TaskType_Wait
+			msg.ok <- struct{}{}
 		} else {
-
+			// 全部结束，可以退出
+			resp.TaskType = TaskType_Exit
+			msg.ok <- struct{}{}
 		}
 	}
 }
 
 func (c *Coordinator) doneTaskHandler(msg DoneTaskMsg) {
-
-}
-
-func (c *Coordinator) heartBeatHandler(msg HeartBeatMsg) {
-
+	req := msg.req
+	if req.TaskType == TaskType_Map && c.phase == TaskPhase_Reduce {
+		// 提交非当前阶段的任务，直接返回
+		msg.ok <- struct{}{}
+		return
+	}
+	for _, task := range c.tasks {
+		if task.TaskId == req.TaskId {
+			// 无论当前状态，直接改为完成
+			task.TaskStatus = TaskStatus_Finished
+			break
+		}
+	}
+	// 删除 timeout 结构
+	delete(c.taskTimeOut, req.TaskId)
+	allDone := true
+	for _, task := range c.tasks {
+		if task.TaskStatus != TaskStatus_Finished {
+			allDone = false
+			break
+		}
+	}
+	if allDone {
+		if c.phase == TaskPhase_Map {
+			c.initReducePhase()
+		} else {
+			c.allDone = true
+		}
+	}
+	msg.ok <- struct{}{}
 }
 
 func (c *Coordinator) timeoutHandler(msg TimeoutMsg) {
-
+	now := time.Now()
+	for taskId, start := range c.taskTimeOut {
+		if now.Sub(start).Seconds() > 10 {
+			for _, task := range c.tasks {
+				if taskId == task.TaskId {
+					if task.TaskStatus != TaskStatus_Finished {
+						task.TaskStatus = TaskStatus_Idle
+					}
+					break
+				}
+			}
+			delete(c.taskTimeOut, taskId)
+			break
+		}
+	}
+	msg.ok <- struct{}{}
+	return
 }
 
 func (c *Coordinator) doneCheckHandler(msg DoneCheckMsg) {
-
+	*msg.res = c.allDone
+	msg.ok <- struct{}{}
 }
 
 // 只在这个 goroutine 中操作结构
@@ -177,8 +213,6 @@ func (c *Coordinator) schedule() {
 			c.getTaskHandler(msg)
 		case msg := <-c.doneTaskChan:
 			c.doneTaskHandler(msg)
-		case msg := <-c.heartBeatChan:
-			c.heartBeatHandler(msg)
 		case msg := <-c.timeoutChan:
 			c.timeoutHandler(msg)
 		case msg := <-c.doneCheckChan:
@@ -207,25 +241,30 @@ func (c *Coordinator) DoneTask(req *DoneTaskReq, _ *DoneTaskResp) error {
 	return nil
 }
 
-func (c *Coordinator) HeartBeat(req *HeartBeatReq, _ *HeartBeatResp) error {
-	msg := HeartBeatMsg{
-		req: req,
-		ok:  make(chan struct{}),
-	}
-	c.heartBeatChan <- msg
-	<-msg.ok
-	return nil
-}
-
 // 初始化 map 任务阶段
-func (c *Coordinator) initPhase(fileNames []string) {
+func (c *Coordinator) initMapPhase(fileNames []string) {
 	c.phase = TaskPhase_Map
 	for i, fileName := range fileNames {
 		c.tasks = append(c.tasks, &Task{
 			TaskId: i,
 			MapTask: MapTask{
-				fileName: fileName,
-				nReduce:  c.nReduce,
+				FileName: fileName,
+				NReduce:  c.nReduce,
+			},
+			TaskStatus: TaskStatus_Idle,
+		})
+	}
+}
+
+func (c *Coordinator) initReducePhase() {
+	c.phase = TaskPhase_Reduce
+	c.taskTimeOut = map[int]time.Time{}
+	c.tasks = nil
+	for i := 0; i < c.nReduce; i++ {
+		c.tasks = append(c.tasks, &Task{
+			TaskId: i,
+			ReduceTask: ReduceTask{
+				NMap: c.nMap,
 			},
 			TaskStatus: TaskStatus_Idle,
 		})
@@ -233,26 +272,32 @@ func (c *Coordinator) initPhase(fileNames []string) {
 }
 
 func (c *Coordinator) timeoutCheck() {
-
+	for {
+		msg := TimeoutMsg{
+			ok: make(chan struct{}),
+		}
+		c.timeoutChan <- msg
+		<-msg.ok
+		time.Sleep(10 * time.Second)
+	}
 }
 
 //
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
+// NReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		nMap:          len(files),
 		nReduce:       nReduce,
-		taskTimeOut:   map[DoneTaskReq]time.Time{},
+		taskTimeOut:   map[int]time.Time{},
 		getTaskChan:   make(chan GetTaskMsg),
 		doneTaskChan:  make(chan DoneTaskMsg),
-		heartBeatChan: make(chan HeartBeatMsg),
 		doneCheckChan: make(chan DoneCheckMsg),
 		timeoutChan:   make(chan TimeoutMsg),
 	}
-	c.initPhase(files)
+	c.initMapPhase(files)
 	go c.schedule()
 	go c.timeoutCheck()
 	c.server()
